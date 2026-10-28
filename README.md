@@ -15,6 +15,11 @@ DeepSeek Desktop is a lightweight, Electron-based application that brings the po
 3. **Open Source**: The application is open-source, allowing users to contribute and modify the code for their needs.
 4. **Cross-Platform**: Available on multiple platforms, ensuring smooth performance and a consistent experience.
 5. **DeepSeek Chat**: Access DeepSeek quickly from a dedicated desktop window.
+6. **🤖 Autonomous Linux AI Agent (New)**:
+   - **Local Command Execution**: Run bash terminal commands safely on Linux with user approval.
+   - **File Management**: Create, read, and edit files right from the chat.
+   - **Web & API Access**: Fetch URLs and web data directly.
+   - **Interactive Agent Toolbar**: Floating overlay with one-click agent prompt injection, auto-approval toggle, and approval dialogs.
 
 Designed for both casual chats and productivity, DeepSeek Desktop offers an easy and secure way to interact with AI on your desktop.
 

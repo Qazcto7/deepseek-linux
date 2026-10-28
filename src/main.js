@@ -1,8 +1,13 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, shell, ipcMain } from 'electron';
 import path from 'path';
 import { config } from './config/index.js';
 import { fileURLToPath } from 'url';
 import electronContextMenu from 'electron-context-menu';
+import { AgentExecutor } from './agent-executor.js';
+
+// Linux & Chromium Stability: Prevent shared memory (/dev/shm) crashes on Linux
+app.commandLine.appendSwitch('disable-dev-shm-usage');
+app.commandLine.appendSwitch('enable-features', 'OverlayScrollbar');
 
 // Constants
 const APP_URL = 'https://chat.deepseek.com';
@@ -18,6 +23,101 @@ electronContextMenu({
 });
 
 let mainWindow = null;
+const executor = new AgentExecutor();
+
+/**
+ * Clean up active child processes and resources before exit
+ */
+function cleanupResources() {
+  try {
+    executor.cleanup();
+  } catch (err) {
+    console.error('Executor cleanup error:', err);
+  }
+}
+
+// Register IPC handlers for Linux system operations
+function setupIpcHandlers() {
+  ipcMain.handle('agent:run-command', async (event, command, timeout) => {
+    try {
+      return await executor.runCommand(
+        command,
+        (chunk) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send('agent:command-chunk', chunk);
+          }
+        },
+        timeout
+      );
+    } catch (err) {
+      return {
+        success: false,
+        exitCode: -1,
+        stdout: '',
+        stderr: err.message,
+        error: err.message,
+        cwd: executor.cwd,
+        durationMs: 0,
+      };
+    }
+  });
+
+  ipcMain.handle('agent:cancel-command', async () => {
+    return executor.cancelActiveCommand();
+  });
+
+  ipcMain.handle('agent:get-command-risk', async (_, command) => {
+    return executor.getRiskAssessment(command);
+  });
+
+  ipcMain.handle('agent:get-cwd', async () => {
+    return executor.cwd;
+  });
+
+  ipcMain.handle('agent:read-file', async (_, filePath, startLine, endLine) => {
+    return await executor.readFile(filePath, startLine, endLine);
+  });
+
+  ipcMain.handle(
+    'agent:write-file',
+    async (_, filePath, content, append = false) => {
+      return await executor.writeFile(filePath, content, append);
+    }
+  );
+
+  ipcMain.handle('agent:append-file', async (_, filePath, content) => {
+    return await executor.writeFile(filePath, content, true);
+  });
+
+  ipcMain.handle('agent:list-directory', async (_, dirPath) => {
+    return await executor.listDirectory(dirPath);
+  });
+
+  ipcMain.handle('agent:file-info', async (_, filePath) => {
+    return await executor.fileInfo(filePath);
+  });
+
+  ipcMain.handle(
+    'agent:edit-file',
+    async (_, filePath, target, replacement, startLine, endLine) => {
+      return await executor.editFile(
+        filePath,
+        target,
+        replacement,
+        startLine,
+        endLine
+      );
+    }
+  );
+
+  ipcMain.handle('agent:fetch-url', async (_, url) => {
+    return await executor.fetchUrl(url);
+  });
+
+  ipcMain.handle('agent:get-system-info', async () => {
+    return await executor.getSystemInfo();
+  });
+}
 
 /**
  * Handles new window creation, specifically for Google Sign-In popups.
@@ -33,12 +133,14 @@ function handleNewWindow(details) {
 }
 
 /**
- * Creates the main application window.
+ * Creates the main application window with crash & memory safety handlers.
  */
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     icon: ICON_PATH,
     autoHideMenuBar: true,
+    width: 1280,
+    height: 900,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -59,6 +161,36 @@ function createMainWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.maximize();
+  });
+
+  // Crash Prevention & Diagnostics
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    console.error('Renderer process gone:', details);
+    executor.cancelActiveCommand();
+    if (
+      details.reason !== 'clean-exit' &&
+      mainWindow &&
+      !mainWindow.isDestroyed()
+    ) {
+      console.warn('Attempting renderer reload after crash...');
+      mainWindow.reload();
+    }
+  });
+
+  mainWindow.webContents.on('unresponsive', () => {
+    console.warn('DeepSeek window became unresponsive. Monitoring...');
+  });
+
+  // Memory Optimization: Clean session cache when minimized
+  mainWindow.on('minimize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.session.clearCache().catch(() => {});
+    }
+  });
+
+  mainWindow.on('closed', () => {
+    cleanupResources();
+    mainWindow = null;
   });
 }
 
@@ -116,6 +248,27 @@ async function initializeApp() {
     app.quit();
     return;
   }
+
+  // Setup IPC Handlers
+  setupIpcHandlers();
+
+  // Child process crash diagnostics
+  app.on('child-process-gone', (event, details) => {
+    console.warn('Child process gone:', details);
+  });
+
+  // Graceful shutdown listeners
+  app.on('before-quit', cleanupResources);
+  app.on('will-quit', cleanupResources);
+
+  process.on('SIGINT', () => {
+    cleanupResources();
+    app.quit();
+  });
+  process.on('SIGTERM', () => {
+    cleanupResources();
+    app.quit();
+  });
 
   // Wait for app to be ready
   await app.whenReady();
