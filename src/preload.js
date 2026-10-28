@@ -517,12 +517,99 @@ function hideModal() {
   if (modal) modal.style.display = 'none';
 }
 
+// Find the specific send button in the DeepSeek chat input area
+function findSendButton(textarea) {
+  if (!textarea) return null;
+
+  // Search within the input container / form first
+  const container =
+    textarea.closest('form') ||
+    textarea.closest('div[class*="input"]') ||
+    textarea.closest('div[class*="chat"]') ||
+    textarea.parentElement?.parentElement?.parentElement ||
+    document;
+
+  const selectors = [
+    'div[role="button"][class*="send"]',
+    'div[role="button"].ds-button--primary:not(.ds-button--disabled)',
+    'button[data-testid="send-button"]',
+    'button[aria-label*="Send"]',
+    'button[aria-label*="Gönder"]',
+    'div[role="button"][aria-label*="Send"]',
+    'div[role="button"][aria-label*="Gönder"]',
+  ];
+
+  for (const sel of selectors) {
+    const btn = container.querySelector(sel);
+    if (
+      btn &&
+      btn.offsetHeight > 0 &&
+      !btn.closest('#agent-toolbar') &&
+      !btn.closest('#agent-modal-card') &&
+      btn.getAttribute('aria-disabled') !== 'true' &&
+      !btn.classList.contains('ds-button--disabled')
+    ) {
+      return btn;
+    }
+  }
+
+  // Fallback: Find any button with an SVG inside the input container
+  const candidates = Array.from(
+    container.querySelectorAll('div[role="button"], button')
+  );
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const b = candidates[i];
+    if (
+      b.querySelector('svg') &&
+      !b.closest('#agent-toolbar') &&
+      !b.closest('#agent-modal-card') &&
+      b.offsetHeight > 0 &&
+      b.getAttribute('aria-disabled') !== 'true' &&
+      !b.classList.contains('ds-button--disabled')
+    ) {
+      return b;
+    }
+  }
+
+  return null;
+}
+
+// Safely trigger submit ONCE (either by clicking the send button OR dispatching Enter, NEVER both!)
+function triggerSubmit(textarea) {
+  if (!textarea) return;
+
+  const sendBtn = findSendButton(textarea);
+  if (sendBtn) {
+    sendBtn.click();
+  } else {
+    // Only fallback to Enter keydown if no send button exists
+    textarea.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+      })
+    );
+  }
+}
+
+let isHandlingUserSubmit = false;
+let isSendingOutput = false;
+
 // Automatically wraps user requests with Agent System Instructions so DeepSeek never says "I cannot access"
 function setupMessageInterceptor() {
   document.addEventListener(
     'keydown',
     (e) => {
-      if (!agentEnabled || isTransforming) return;
+      if (
+        !agentEnabled ||
+        isTransforming ||
+        isSendingOutput ||
+        isHandlingUserSubmit
+      )
+        return;
       const textarea =
         document.querySelector('textarea#chat-input') ||
         document.querySelector('textarea');
@@ -538,7 +625,13 @@ function setupMessageInterceptor() {
   document.addEventListener(
     'click',
     (e) => {
-      if (!agentEnabled || isTransforming) return;
+      if (
+        !agentEnabled ||
+        isTransforming ||
+        isSendingOutput ||
+        isHandlingUserSubmit
+      )
+        return;
       const textarea =
         document.querySelector('textarea#chat-input') ||
         document.querySelector('textarea');
@@ -551,7 +644,13 @@ function setupMessageInterceptor() {
         !btn.closest('#agent-toolbar') &&
         !btn.closest('#agent-modal-card')
       ) {
-        handleUserSubmit(textarea, e);
+        const sendBtn = findSendButton(textarea);
+        if (
+          sendBtn &&
+          (btn === sendBtn || btn.contains(sendBtn) || sendBtn.contains(btn))
+        ) {
+          handleUserSubmit(textarea, e);
+        }
       }
     },
     true
@@ -562,19 +661,24 @@ function handleUserSubmit(textarea, event) {
   const text = (textarea.value || '').trim();
   if (!text) return;
 
-  // If already contains system tags, let it pass through normally
+  // If already contains system tags or in the middle of sending, let it pass through normally
   if (
     text.startsWith('[SİSTEM TALİMATI]') ||
-    text.startsWith('[SİSTEM ÇIKTISI]')
+    text.startsWith('[SİSTEM ÇIKTISI]') ||
+    isHandlingUserSubmit ||
+    isSendingOutput
   ) {
     return;
   }
 
   // Intercept and wrap with Agent instructions
-  event.preventDefault();
-  event.stopPropagation();
-  event.stopImmediatePropagation();
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
 
+  isHandlingUserSubmit = true;
   isTransforming = true;
   const fullPrompt = `${AGENT_SYSTEM_PROMPT}\n\nKULLANICI GÖREVİ:\n${text}`;
 
@@ -589,34 +693,13 @@ function handleUserSubmit(textarea, event) {
   showToast('🤖 Ajan Talimatı Otomatik Eklendi...');
 
   setTimeout(() => {
-    isTransforming = false;
-    const buttons = Array.from(
-      document.querySelectorAll('div[role="button"], button')
-    );
-    let clicked = false;
-    for (let i = buttons.length - 1; i >= 0; i--) {
-      const b = buttons[i];
-      if (
-        b.querySelector('svg') &&
-        !b.closest('#agent-toolbar') &&
-        !b.closest('#agent-modal-card') &&
-        b.offsetHeight > 0
-      ) {
-        b.click();
-        clicked = true;
-        break;
-      }
-    }
-    if (!clicked) {
-      textarea.dispatchEvent(
-        new KeyboardEvent('keydown', {
-          key: 'Enter',
-          code: 'Enter',
-          keyCode: 13,
-          which: 13,
-          bubbles: true,
-        })
-      );
+    try {
+      triggerSubmit(textarea);
+    } finally {
+      setTimeout(() => {
+        isTransforming = false;
+        isHandlingUserSubmit = false;
+      }, 300);
     }
   }, 120);
 }
@@ -646,45 +729,34 @@ function sendOutputToDeepSeek(output) {
     document.querySelector('textarea');
   if (!textarea) return;
 
+  if (isSendingOutput) return; // Prevent concurrent send calls
+  isSendingOutput = true;
   isTransforming = true;
-  textarea.focus();
-  const setter = Object.getOwnPropertyDescriptor(
-    window.HTMLTextAreaElement.prototype,
-    'value'
-  ).set;
-  setter.call(textarea, output);
-  textarea.dispatchEvent(new Event('input', { bubbles: true }));
-  textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+  try {
+    textarea.focus();
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      'value'
+    ).set;
+    setter.call(textarea, output);
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (err) {
+    console.error('Textarea set error:', err);
+  }
 
   setTimeout(() => {
-    isTransforming = false;
-    const buttons = Array.from(
-      document.querySelectorAll('div[role="button"], button')
-    );
-    let clicked = false;
-    for (let i = buttons.length - 1; i >= 0; i--) {
-      const btn = buttons[i];
-      if (
-        btn.querySelector('svg') &&
-        !btn.closest('#agent-toolbar') &&
-        !btn.closest('#agent-modal-card') &&
-        btn.offsetHeight > 0
-      ) {
-        btn.click();
-        clicked = true;
-        break;
-      }
+    try {
+      // Safely triggers send ONCE via button click OR Enter key, never both
+      triggerSubmit(textarea);
+    } finally {
+      setTimeout(() => {
+        isTransforming = false;
+        isSendingOutput = false;
+      }, 350);
     }
-    textarea.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-      })
-    );
-  }, 400);
+  }, 350);
 }
 
 async function executeAction(action) {
@@ -779,7 +851,6 @@ async function executeAction(action) {
   } catch (err) {
     resultOutput = `[SİSTEM ÇIKTISI - KRİTİK HATA]\n${err.message}`;
   } finally {
-    isExecuting = false;
     hideModal();
   }
 
@@ -787,6 +858,11 @@ async function executeAction(action) {
   sendOutputToDeepSeek(
     `${resultOutput}\n\nBir sonraki eylemini veya iş bittiyse done JSON'unu belirt.`
   );
+
+  // Keep isExecuting active until message is sent to prevent duplicate observer trigger
+  setTimeout(() => {
+    isExecuting = false;
+  }, 1000);
 }
 
 function findBalancedJson(text) {
